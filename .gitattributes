@@ -1,2 +1,302 @@
+import requests
+import folium
+from shapely.geometry import Point, mapping
+from shapely.ops import transform, unary_union
+import pyproj
+from datetime import datetime, timedelta, timezone
+
+# -------------------------
+# HURRICANE DATA (ArcGIS API)
+# -------------------------
+url_hurr = "https://services9.arcgis.com/RHVPKKiFTONKtxq3/arcgis/rest/services/Active_Hurricanes_v1/FeatureServer/0/query"
+params = {"where": "1=1", "outFields": "*", "f": "geojson"}
+print("Fetching hurricane data...")
+resp = requests.get(url_hurr, params=params)
+resp.raise_for_status()
+hurr_data = resp.json()
+
+# -------------------------
+# EARTHQUAKE DATA (ArcGIS API)
+# -------------------------
+url_eq_points = "https://services9.arcgis.com/RHVPKKiFTONKtxq3/arcgis/rest/services/USGS_Seismic_Data_v1/FeatureServer/0/query"
+params_eq_points = {"where": "1=1", "outFields": "*", "f": "geojson"}
+print("Fetching seismic event (magnitude points) data...")
+resp_eq_points = requests.get(url_eq_points, params=params_eq_points)
+resp_eq_points.raise_for_status()
+eq_points_data = resp_eq_points.json()
+
+url_eq_intensity = "https://services9.arcgis.com/RHVPKKiFTONKtxq3/arcgis/rest/services/USGS_Seismic_Data_v1/FeatureServer/1/query"
+params_eq_intensity = {"where": "1=1", "outFields": "*", "f": "geojson"}
+print("Fetching shake intensity polygons data...")
+resp_eq_intensity = requests.get(url_eq_intensity, params=params_eq_intensity)
+resp_eq_intensity.raise_for_status()
+eq_intensity_data = resp_eq_intensity.json()
+
+# -------------------------
+# MAP INITIALIZATION
+# -------------------------
+m = folium.Map(
+    location=[20, -60],
+    zoom_start=3,
+    tiles="CartoDB dark_matter",
+    maxBounds=[[-90, -180], [90, 180]]
+)
+
+hurricane_layer = folium.FeatureGroup(name="Hurricanes", show=True)
+eq_points_layer = folium.FeatureGroup(name="Seismic Events", show=True)
+eq_intensity_layer = folium.FeatureGroup(name="Shake Intensity", show=True)
+
+# Hurricane category colors
+cat_colors = {0: "#00ff00", 1: "#ffff00", 2: "#ffcc00", 3: "#ff9900", 4: "#ff3300", 5: "#cc0000"}
+
+nm_to_m = 1852
+
+# Projection transformers
+proj_wgs84 = pyproj.CRS("EPSG:4326")
+proj_eqc = pyproj.CRS("EPSG:3857")
+project = pyproj.Transformer.from_crs(proj_wgs84, proj_eqc, always_xy=True).transform
+project_back = pyproj.Transformer.from_crs(proj_eqc, proj_wgs84, always_xy=True).transform
+
+# -------------------------
+# PROCESS HURRICANES
+# -------------------------
+storms = {}
+for feat in hurr_data["features"]:
+    props = feat["properties"]
+    storm_name = props.get("STORMNAME", "Unknown")
+    lat = props.get("LAT")
+    lon = props.get("LON")
+    ss_category = props.get("SS", 0)
+    if lat is None or lon is None:
+        continue
+    if storm_name not in storms:
+        storms[storm_name] = {"points": [], "categories": []}
+    storms[storm_name]["points"].append((lon, lat))
+    storms[storm_name]["categories"].append(ss_category)
+
+for storm_name, storm in storms.items():
+    points = storm["points"]
+    categories = storm["categories"]
+
+    # Track line
+    folium.PolyLine(
+        [(lat, lon) for lon, lat in points],
+        color="blue",
+        weight=2,
+        opacity=0.7,
+        tooltip=f"{storm_name} Track",
+    ).add_to(hurricane_layer)
+
+    # Forecast cone
+    circles = []
+    for i, ((lon, lat), cat) in enumerate(zip(points, categories)):
+        radius_nm = 40 + i * 30
+        radius_m = radius_nm * nm_to_m
+        point = Point(lon, lat)
+        point_m = transform(project, point)
+        circle_m = point_m.buffer(radius_m)
+        circles.append(circle_m)
+
+    if circles:
+        cone = unary_union(circles)
+        cone_wgs = transform(project_back, cone)
+        folium.GeoJson(
+            mapping(cone_wgs),
+            style_function=lambda x: {
+                "color": "#003366",      # navy outline
+                "fillColor": "#66ccff",  # light blue fill
+                "fillOpacity": 0.25,
+                "weight": 1,
+            },
+            tooltip=f"{storm_name} Forecast Cone",
+        ).add_to(hurricane_layer)
+
+# -------------------------
+# PROCESS SEISMIC EVENTS (M ≥ 4.5, last 7 days, 4.5 ≤ M < 5 smaller)
+# -------------------------
+now = datetime.now(timezone.utc)
+seven_days_ago = now - timedelta(days=7)
+
+for feat in eq_points_data.get("features", []):
+    props = feat.get("properties", {})
+    geom = feat.get("geometry")
+    if geom is None:
+        continue
+    coords = geom.get("coordinates", [])
+    if not coords or len(coords) < 2:
+        continue
+    lon, lat = coords[0], coords[1]
+    mag = props.get("mag", None)
+    event_time_val = props.get("eventTime", None)
+    if mag is None or mag < 4.5 or event_time_val is None:
+        continue
+    try:
+        event_time = datetime.fromtimestamp(event_time_val / 1000, tz=timezone.utc)
+    except Exception:
+        continue
+    if event_time < seven_days_ago:
+        continue
+
+    radius = 2 + (mag * 2)
+    if 4.5 <= mag < 5.0:
+        radius = radius * 0.5
+        col = "#fecc5c"
+    elif mag < 7.5:
+        col = "#fd8d3c"
+    else:
+        col = "#e31a1c"
+
+    folium.CircleMarker(
+        location=(lat, lon),
+        radius=radius,
+        color=col,
+        fill=True,
+        fill_color=col,
+        fill_opacity=0.7,
+        tooltip=f"Magnitude: {mag}, Time: {event_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+    ).add_to(eq_points_layer)
+
+# -------------------------
+# PROCESS SHAKE INTENSITY (grid_value ≥ 5, last 7 days)
+# -------------------------
+filtered_intensity_features = []
+for feat in eq_intensity_data.get("features", []):
+    props = feat.get("properties", {})
+    grid_val = props.get("grid_value", 0)
+    event_time_val = props.get("eventTime", None)
+    if grid_val < 5 or event_time_val is None:
+        continue
+    try:
+        event_time = datetime.fromtimestamp(event_time_val / 1000, tz=timezone.utc)
+    except Exception:
+        continue
+    if event_time < seven_days_ago:
+        continue
+
+    # Format time to "00:00 dd/mm/yy"
+    props["eventTime"] = datetime.fromtimestamp(
+        event_time_val / 1000, tz=timezone.utc
+    ).strftime("%H:%M %d/%m/%y")
+
+    filtered_intensity_features.append(feat)
+
+if filtered_intensity_features:
+    folium.GeoJson(
+        {"type": "FeatureCollection", "features": filtered_intensity_features},
+        style_function=lambda feat: {
+            "fillColor": "#ff0000" if feat["properties"].get("grid_value", 0) >= 8 else "#ff9999",
+            "color": "none",
+            "fillOpacity": 0.4,
+            "weight": 0
+        },
+        tooltip=folium.GeoJsonTooltip(fields=["grid_value", "eventTime"], aliases=["Intensity", "Time"])
+    ).add_to(eq_intensity_layer)
+
+# -------------------------
+# COLLAPSIBLE LEGEND + QUICK ZOOM
+# -------------------------
+legend_html = f"""
+<div id="legend" style="
+    position: fixed;
+    bottom: 30px;
+    left: 30px;
+    width: 340px;
+    background-color: white;
+    border:2px solid grey;
+    z-index:9999;
+    font-size:14px;
+    border-radius: 8px;
+    ">
+    <div onclick="toggleLegend()" style="background:#f2f2f2;cursor:pointer;padding:5px;font-weight:bold;">
+        Legend (click to expand/collapse)
+    </div>
+    <div id="legend-content" style="display:none; padding:10px;">
+        <b>Hurricanes</b><br>
+        <i style="background:#66ccff;width:15px;height:15px;float:left;margin-right:5px;border:1px solid #003366;"></i> Forecast Cone<br>
+        <i style="background:blue;width:15px;height:2px;float:left;margin-right:5px;"></i> Track<br><br>
+"""
+for cat, color in cat_colors.items():
+    legend_html += f"""
+        <i style="background:{color};width:15px;height:15px;float:left;margin-right:5px;"></i>
+        Category {cat}<br>
+    """
+legend_html += """
+        <br><b>Seismic Events (last 7 days)</b><br>
+        <i style="background:#fecc5c;width:15px;height:15px;float:left;margin-right:5px;"></i> 4.5 ≤ Mag < 5.0 (smaller)<br>
+        <i style="background:#fd8d3c;width:15px;height:15px;float:left;margin-right:5px;"></i> 5.0 ≤ Mag < 7.5<br>
+        <i style="background:#e31a1c;width:15px;height:15px;float:left;margin-right:5px;"></i> Mag ≥ 7.5<br>
+        <br><b>Shake Intensity (last 7 days)</b><br>
+        <i style="background:#ff9999;width:15px;height:15px;float:left;margin-right:5px;"></i> 5 ≤ grid_value < 8<br>
+        <i style="background:#ff0000;width:15px;height:15px;float:left;margin-right:5px;"></i> grid_value ≥ 8<br>
+        <br><b>Quick Zoom</b><br>
+        <div style="margin-top:5px;">
+          <div onclick="zoomTo('usa')" style="display:inline-block; padding:4px 8px; margin:2px; background:#007bff; color:white; border-radius:4px; cursor:pointer;">USA</div>
+          <div onclick="zoomTo('europe')" style="display:inline-block; padding:4px 8px; margin:2px; background:#007bff; color:white; border-radius:4px; cursor:pointer;">Europe</div>
+          <div onclick="zoomTo('japan')" style="display:inline-block; padding:4px 8px; margin:2px; background:#007bff; color:white; border-radius:4px; cursor:pointer;">Japan</div>
+          <div onclick="zoomTo('world')" style="display:inline-block; padding:4px 8px; margin:2px; background:#6c757d; color:white; border-radius:4px; cursor:pointer;">World</div>
+        </div>
+    </div>
+</div>
+{% raw %}
+<script>
+function toggleLegend() {
+    var x = document.getElementById("legend-content");
+    if (x.style.display === "none") {
+        x.style.display = "block";
+    } else {
+        x.style.display = "none";
+    }
+}
+
+function zoomTo(region) {
+    var bounds = {
+        usa: [[24.396308,-125.0],[49.384358,-66.93457]],
+        europe: [[36.0,-10.0],[71.0,40.0]],
+        japan: [[30.0,129.0],[46.0,146.0]],
+        world: [[-60,-180],[80,180]]
+    };
+    if (window._leaflet_map && bounds[region]) {
+        window._leaflet_map.fitBounds(bounds[region]);
+    }
+}
+
+// Grab the first Leaflet map Folium created
+setTimeout(function() {
+    if (typeof L !== "undefined" && L.map) {
+        for (var key in window) {
+            if (window[key] instanceof L.Map) {
+                window._leaflet_map = window[key];
+                break;
+            }
+        }
+    }
+
+    if (window._leaflet_map) {
+        window._leaflet_map.setMaxBounds([[-90,-180],[90,180]]);
+        window._leaflet_map.options.minZoom = 2;
+        window._leaflet_map.options.maxBoundsViscosity = 1.0;
+    }
+}, 500);
+
+// Auto-refresh every 5 minutes
+setTimeout(function(){ location.reload(); }, 300000);
+</script>
+{% endraw %}
+"""
+m.get_root().html.add_child(folium.Element(legend_html))
+
+# -------------------------
+# ADD LAYERS TO MAP
+# -------------------------
+hurricane_layer.add_to(m)
+eq_points_layer.add_to(m)
+eq_intensity_layer.add_to(m)
+folium.LayerControl(collapsed=False).add_to(m)
+
+# -------------------------
+# SAVE MAP
+# -------------------------
+m.save("hurricanes_earthquakes.html")
+print("✅ Map saved as hurricanes_earthquakes.html")
 # Auto detect text files and perform LF normalization
 * text=auto
