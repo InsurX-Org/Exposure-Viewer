@@ -973,19 +973,27 @@ WITH loc_dedup AS (
         longitude,
         "100% tiv" AS total_insurable_value,
         eqsitelcur AS value_currency,
-        rule AS participant_name
+        rule AS participant_name,
+        locname
     FROM g_exposure_reporting.g_loc_incremental_latest_no_endorsements
     WHERE cntrycode IS NOT NULL
       AND latitude IS NOT NULL
       AND longitude IS NOT NULL
 ),
-acc_dedup AS (
+acc_usd AS (
     SELECT DISTINCT
-        account_number,
-        attachment_point,
-        policy_limit_currency
-    FROM s_core_reporting.s_acc_incremental
-    WHERE account_number IS NOT NULL
+        a.accntnum AS account_number,
+        a.accntname,
+        a.rule AS participant_name,
+        a.blanlimamt,  -- raw policy limit
+        -- Convert attachment and limit to USD
+        a.undcovamt / NULLIF(er_att.conversion_rate, 0) AS attachment_point_usd,
+        (a.partof * a.blanlimamt) / NULLIF(er_lim.conversion_rate, 0) AS policy_limit_usd
+    FROM g_exposure_reporting.g_acc_incremental_latest_no_endorsements a
+    LEFT JOIN s_misc.exchange_rates_monthend er_att
+        ON a.undcovcur = er_att.converted_currency AND er_att.monthyear = 202510
+    LEFT JOIN s_misc.exchange_rates_monthend er_lim
+        ON a.blanlimcur = er_lim.converted_currency AND er_lim.monthyear = 202510
 ),
 trapped_per_location AS (
     SELECT
@@ -993,71 +1001,73 @@ trapped_per_location AS (
         l.country_code,
         l.latitude,
         l.longitude,
-        COALESCE(l.participant_name, 'Unassigned') AS participant_name,
+        COALESCE(l.participant_name, a.participant_name, 'Unassigned') AS participant_name,
         l.total_insurable_value,
-        a.attachment_point,
-        l.value_currency AS location_currency,
-        a.policy_limit_currency AS policy_currency
+        l.value_currency,
+        a.attachment_point_usd,
+        a.policy_limit_usd,
+        a.blanlimamt,
+        l.locname,
+        a.accntname
     FROM loc_dedup l
-    LEFT JOIN acc_dedup a
+    LEFT JOIN acc_usd a
         ON l.account_number = a.account_number
+       AND l.participant_name = a.participant_name  
 ),
 trapped_with_usd AS (
     SELECT
-        tpl.*,
+        tpl.country_code,
+        tpl.latitude,
+        tpl.longitude,
+        tpl.participant_name,
+        tpl.locname,
+        tpl.accntname,
+        tpl.policy_limit_usd,
+        tpl.blanlimamt,
+        -- trapped exposure above attachment in USD
         GREATEST(
-            COALESCE((tpl.total_insurable_value / NULLIF(er_l.conversion_rate, 0)), 0)
-            - COALESCE((tpl.attachment_point / NULLIF(er_a.conversion_rate, 0)), 0),
+            COALESCE(tpl.total_insurable_value / NULLIF(er_val.conversion_rate, 0), 0)
+            - COALESCE(tpl.attachment_point_usd, 0),
             0
-        ) AS trapped_exposure_usd
+        ) AS trapped_above_attachment_usd
     FROM trapped_per_location tpl
-    LEFT JOIN s_misc.exchange_rates_monthend er_l
-        ON tpl.location_currency = er_l.converted_currency 
-       AND er_l.monthyear = 202510
-    LEFT JOIN s_misc.exchange_rates_monthend er_a
-        ON tpl.policy_currency = er_a.converted_currency 
-       AND er_a.monthyear = 202510
+    LEFT JOIN s_misc.exchange_rates_monthend er_val
+        ON tpl.value_currency = er_val.converted_currency AND er_val.monthyear = 202510
 ),
-with_all_rows AS (
-    -- individual participants
-    SELECT 
+aggregated AS (
+    SELECT
         country_code,
         latitude,
         longitude,
         participant_name,
-        trapped_exposure_usd
+        locname,
+        accntname,
+        SUM(trapped_above_attachment_usd) AS trapped_above_attachment_usd,
+        SUM(policy_limit_usd) AS policy_limit_usd,
+        SUM(blanlimamt) AS total_blanlimamt
     FROM trapped_with_usd
-    WHERE trapped_exposure_usd > 0
-
-    UNION ALL
-
-    -- summed "All" row per location
-    SELECT 
-        country_code,
-        latitude,
-        longitude,
-        'All' AS participant_name,
-        SUM(trapped_exposure_usd) AS trapped_exposure_usd
-    FROM (
-        SELECT DISTINCT country_code, latitude, longitude, participant_name, trapped_exposure_usd
-        FROM trapped_with_usd
-        WHERE trapped_exposure_usd > 0
-    ) unique_participants
-    GROUP BY country_code, latitude, longitude
+    GROUP BY country_code, latitude, longitude, participant_name, locname, accntname
 )
 SELECT
     country_code,
     latitude,
     longitude,
     participant_name,
-    trapped_exposure_usd
-FROM with_all_rows
-ORDER BY 
+    locname,
+    accntname,
+    LEAST(trapped_above_attachment_usd, policy_limit_usd) AS trapped_exposure_usd,
+    LEAST(trapped_above_attachment_usd, policy_limit_usd)
+        * (total_blanlimamt / NULLIF(policy_limit_usd, 0)) AS participant_value_usd
+FROM aggregated
+WHERE LEAST(trapped_above_attachment_usd, policy_limit_usd) > 0
+ORDER BY
     country_code,
     latitude,
     longitude,
-    CASE WHEN participant_name = 'All' THEN 0 ELSE 1 END,
-    participant_name;
+    participant_name,
+    locname,
+    accntname;
+
 """
 
 tiv_df = pd.read_sql(text(tiv_sql), con=engine)
@@ -1205,6 +1215,7 @@ if not tiv_df.empty:
         print("⚠️ No valid trapped exposure points for heatmap")
 else:
     print("⚠️ No trapped exposure points available")
+
 
 # PROBABILISTIC HURRICANE / STORM EXPOSURE
 
@@ -1799,9 +1810,13 @@ m.get_root().html.add_child(folium.Element(disaster_panel_html))
 # TOP BANNER (text only) + LARGE LENS TEXT + SHIFTED UI CONTROLS
 
 import json
+ 
+# === PARTICIPANT DROPDOWN + LIVE TRAPPED EXPOSURE PANEL ===
 
-participants = sorted(tiv_df['participant_name'].dropna().unique().tolist())
-participant_json = json.dumps(participants)
+participant_trapped = (
+    tiv_df.groupby('participant_name')['trapped_exposure_usd'].sum().to_dict()
+)
+participant_json = json.dumps(participant_trapped)
 
 banner_html = f"""
 <div id="top-banner" style="
@@ -1817,43 +1832,24 @@ banner_html = f"""
     justify-content: flex-start;
     padding: 5px 20px;
     font-family: Arial, sans-serif;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.5);
     height: 50px;
     box-sizing: border-box;
-    white-space: nowrap;
 ">
     <span style="font-size: 36px; font-weight: bold;">LENS</span>
-    <span style="font-size: 12px; font-weight: normal; margin-left: 10px;"> Loss Exposure & Natural-hazard Scanner</span>
+    <span style="font-size: 12px; margin-left: 10px;">Loss Exposure & Natural-hazard Scanner</span>
 
-    <select id="participantSelect" multiple style="margin-left:20px; padding:2px; font-size:12px;" onchange="filterByParticipant()">
-    </select>
+    <select id="participantSelect" multiple style="margin-left:20px; padding:2px; font-size:12px;" onchange="updateParticipantView()"></select>
+
+    <div style="margin-left: 40px; font-size:13px;">
+        <b>Total Trapped Exposure (USD):</b> <span id="total-trapped" style="color:#00FF7F;">0</span>
+    </div>
 </div>
 
 <script>
-// --- Map reference ---
-var map = null;
-function getMap() {{
-    if(window._leaflet_map) return window._leaflet_map;
-    for(var k in window) {{
-        if(window[k] instanceof L.Map) {{
-            window._leaflet_map = window[k]; 
-            return window._leaflet_map;
-        }}
-    }}
-    return null;
-}}
-map = getMap();
-
-<script>
-// ==========================================
-// PARTICIPANT DROPDOWN + MAP FILTERING
-// ==========================================
-
-// Initialize dropdown from Python dictionary
+window.participantTrapped = {participant_json};
 var participants = Object.keys(window.participantTrapped || {{}});
-var select = document.getElementById('participantSelect');
 
-// Populate dropdown options
+var select = document.getElementById('participantSelect');
 participants.forEach(function(p) {{
     var opt = document.createElement('option');
     opt.value = p;
@@ -1861,80 +1857,48 @@ participants.forEach(function(p) {{
     select.appendChild(opt);
 }});
 
-// Main update function
+function getMap() {{
+    if(window._leaflet_map) return window._leaflet_map;
+    for(var k in window) {{
+        if(window[k] instanceof L.Map) {{
+            window._leaflet_map = window[k];
+            return window._leaflet_map;
+        }}
+    }}
+    return null;
+}}
+
 function updateParticipantView() {{
     var selected = Array.from(select.selectedOptions).map(opt => opt.value);
-    var map = window._leaflet_map || Object.values(window).find(v => v instanceof L.Map);
+    var map = getMap();
+    if(!map) return;
 
-    // -------------------------------
-    // Filter polygons + heatmaps
-    // -------------------------------
+    // Toggle visibility for participant layers
     participants.forEach(function(p) {{
         ['1','2'].forEach(function(id) {{
-            var layerKey = p + '_' + id;
-            var layer = window.participant_layers[layerKey];
-            if(layer) {{
-                if(selected.includes(p)) map.addLayer(layer);
-                else map.removeLayer(layer);
+            var key = p + '_' + id;
+            if(window.participant_layers && window.participant_layers[key]) {{
+                if(selected.includes(p)) map.addLayer(window.participant_layers[key]);
+                else map.removeLayer(window.participant_layers[key]);
             }}
         }});
-
-        var heatKey = 'heat_' + p.replace(/\\s+/g,'_');
-        var heatLayer = window[heatKey] ? window[heatKey].layer : null;
-        if(heatLayer) {{
-            if(selected.includes(p)) map.addLayer(heatLayer);
-            else map.removeLayer(heatLayer);
+        var heatKey = p + '_heat';
+        if(window.participant_layers && window.participant_layers[heatKey]) {{
+            if(selected.includes(p)) map.addLayer(window.participant_layers[heatKey]);
+            else map.removeLayer(window.participant_layers[heatKey]);
         }}
     }});
 
-    // -------------------------------
-    // Filter TIV points dynamically
-    // -------------------------------
-    if(window.tivPointsLayer) map.removeLayer(window.tivPointsLayer);
-
-    var points = window.allTivPoints || [];
-    var filteredPoints = selected.length
-        ? points.filter(pt => selected.includes(pt.participant))
-        : points;
-
-    window.tivPointsLayer = L.layerGroup(filteredPoints.map(function(pt) {{
-        return L.circleMarker([pt.lat, pt.lon], {{
-            radius: 4,
-            color: '#007bff',
-            fillColor: '#007bff',
-            fillOpacity: 0.7
-        }}).bindTooltip(`${{pt.participant}}<br>$${{pt.value.toLocaleString()}}`);
-    }})).addTo(map);
-
-    // -------------------------------
-    // Live totals from filtered points
-    // -------------------------------
-    var total = 0, hurricane = 0, eq = 0;
-
-    filteredPoints.forEach(pt => {{
-        total += pt.value || 0;
-        if(pt.hazard === 'hurricane') hurricane += pt.value || 0;
-        if(pt.hazard === 'earthquake') eq += pt.value || 0;
+    // Update trapped exposure totals
+    var total = 0;
+    selected.forEach(function(p) {{
+        if(window.participantTrapped[p]) total += window.participantTrapped[p];
     }});
-
-    // Update summary boxes
     document.getElementById('total-trapped').innerText = total.toLocaleString();
-    document.getElementById('hurricane-trapped').innerText = hurricane > 0 ? hurricane.toLocaleString() : '';
-    document.getElementById('eq-trapped').innerText = eq > 0 ? eq.toLocaleString() : '';
-
-    // Show/hide sections dynamically
-    document.getElementById('total-trapped').parentElement.style.display = total > 0 ? 'block' : 'none';
-    document.getElementById('hurricane-trapped').parentElement.style.display = hurricane > 0 ? 'block' : 'none';
-    document.getElementById('eq-trapped').parentElement.style.display = eq > 0 ? 'block' : 'none';
 }}
-
-// Hook up listener
-select.addEventListener('change', updateParticipantView);
-updateParticipantView();  // Initialize on load
 </script>
 
 <style>
-/* Ensure dropdown appears above banner and map */
 #participantSelect {{
     position: relative;
     z-index: 1200;
@@ -1943,10 +1907,10 @@ updateParticipantView();  // Initialize on load
 .leaflet-top.leaflet-left, .leaflet-top.leaflet-right {{ top: 50px; }}
 </style>
 """
+
 m.get_root().html.add_child(folium.Element(banner_html))
 
 # SAVE MAP
 
 m.save("full_disaster_map_test.html")
 print("✅ Map saved as full_disaster_map_test.html")
-
