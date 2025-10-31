@@ -1070,6 +1070,7 @@ ORDER BY
 
 """
 
+# Load TIV data
 tiv_df = pd.read_sql(text(tiv_sql), con=engine)
 
 if tiv_df.empty:
@@ -1078,35 +1079,39 @@ else:
     print(f"✅ Loaded {len(tiv_df)} rows of exposure data.")
     print(tiv_df.head())
 
-points_gdf = gpd.GeoDataFrame(columns=list(tiv_df.columns) + ['geometry'], crs="EPSG:4326")
+# Ensure required columns exist
+required_cols = ['latitude', 'longitude', 'trapped_exposure_usd', 'participant_name']
+for col in required_cols:
+    if col not in tiv_df.columns:
+        if col == 'participant_name':
+            tiv_df[col] = 'Unknown'
+        else:
+            tiv_df[col] = np.nan
 
-if tiv_df.empty:
-    print("⚠️ No data returned from SQL query.")
-else:
-    missing = [c for c in ["latitude", "longitude", "trapped_exposure_usd"] if c not in tiv_df.columns]
-    if missing:
-        print(f"⚠️ Missing columns in TIV results: {missing}")
-    else:
-        print(f"✅ Columns loaded: {list(tiv_df.columns)}")
+# Fill missing participant names
+tiv_df['participant_name'] = tiv_df['participant_name'].fillna('Unknown')
 
-if not tiv_df.empty:
-    for col in ['trapped_exposure_usd','latitude','longitude']:
-        tiv_df[col] = tiv_df[col].astype(float)
+# Convert numeric columns
+for col in ['trapped_exposure_usd', 'latitude', 'longitude']:
+    tiv_df[col] = tiv_df[col].astype(float)
 
-if not tiv_df.empty and 'country_code' in tiv_df.columns:
+# Map country names if country_code exists
+if 'country_code' in tiv_df.columns:
     tiv_df['country_name'] = tiv_df['country_code'].map(code_to_country)
     tiv_df = tiv_df.dropna(subset=['country_name'])
 
-if not tiv_df.empty and {'latitude','longitude'}.issubset(tiv_df.columns):
+# Create GeoDataFrame including participant_name
+if {'latitude', 'longitude'}.issubset(tiv_df.columns) and not tiv_df.empty:
     points_gdf = gpd.GeoDataFrame(
         tiv_df,
         geometry=gpd.points_from_xy(tiv_df.longitude, tiv_df.latitude),
         crs="EPSG:4326"
     )
 else:
-    points_gdf = gpd.GeoDataFrame(columns=tiv_df.columns+['geometry'], crs="EPSG:4326")
+    points_gdf = gpd.GeoDataFrame(columns=list(tiv_df.columns) + ['geometry'], crs="EPSG:4326")
 
-if not tiv_df.empty and 'country_name' in tiv_df.columns:
+# Aggregate trapped exposure by country
+if 'country_name' in tiv_df.columns and not tiv_df.empty:
     trapped_agg = tiv_df.groupby('country_name')['trapped_exposure_usd'].sum().reset_index()
 else:
     trapped_agg = pd.DataFrame(columns=['country_name','trapped_exposure_usd'])
@@ -1218,7 +1223,7 @@ else:
 
 
 # PROBABILISTIC HURRICANE / STORM EXPOSURE
-
+# HURRICANES / STORM POLYGONS
 if 'prob_gdf' in locals() and not prob_gdf.empty and not points_gdf.empty:
     # Ensure CRS alignment
     prob_gdf = prob_gdf.to_crs(points_gdf.crs)
@@ -1231,24 +1236,25 @@ if 'prob_gdf' in locals() and not prob_gdf.empty and not points_gdf.empty:
     join_prob = gpd.sjoin(points_gdf, prob_gdf, how="inner", predicate="within")
 
     if not join_prob.empty:
+        # Keep participant_name in aggregation
         trapped_per_storm_prob = (
-            join_prob.groupby(["storm","prob"], as_index=False)
+            join_prob.groupby(["storm","prob","participant_name"], as_index=False)
             .apply(lambda df: pd.Series({
                 "trapped_exposure_usd": (df["trapped_exposure_usd"] * df["prob"]).sum()
             }))
         )
         trapped_per_storm_prob['trapped_exposure_usd'] = trapped_per_storm_prob['trapped_exposure_usd'].fillna(0)
     else:
-        trapped_per_storm_prob = pd.DataFrame(columns=["storm","prob","trapped_exposure_usd"])
+        trapped_per_storm_prob = pd.DataFrame(columns=["storm","prob","participant_name","trapped_exposure_usd"])
         print("⚠️ No points joined to hurricane polygons — check CRS and geometry validity.")
 else:
-    trapped_per_storm_prob = pd.DataFrame(columns=["storm","prob","trapped_exposure_usd"])
+    trapped_per_storm_prob = pd.DataFrame(columns=["storm","prob","participant_name","trapped_exposure_usd"])
     print("⚠️ prob_gdf or points_gdf is empty")
 
 # EARTHQUAKES ≥6
-
 if 'eq_points_data' in locals():
-    eq_features = [f for f in eq_points_data.get("features", []) if isinstance(f.get("properties", {}).get("mag"), (int,float)) and f["properties"]["mag"] >= 6]
+    eq_features = [f for f in eq_points_data.get("features", []) 
+                   if isinstance(f.get("properties", {}).get("mag"), (int,float)) and f["properties"]["mag"] >= 6]
     eq_records = []
     for i,f in enumerate(eq_features):
         try:
@@ -1266,7 +1272,6 @@ else:
     eq_gdf = gpd.GeoDataFrame(columns=["eq_id","geometry","mag","place"], geometry="geometry", crs="EPSG:3857")
 
 # SHAKE POLYGONS
-
 shake_features = eq_intensity_data.get("features", []) if 'eq_intensity_data' in locals() else []
 shake_polys = []
 for i,f in enumerate(shake_features):
@@ -1281,7 +1286,6 @@ for i,f in enumerate(shake_features):
 shake_gdf = gpd.GeoDataFrame(shake_polys, geometry="geometry", crs="EPSG:3857") if shake_polys else gpd.GeoDataFrame(columns=["shake_id","geometry","intensity"], geometry="geometry", crs="EPSG:3857")
 
 # LINK SHAKE POLYGONS TO NEAREST EARTHQUAKE
-
 if not shake_gdf.empty and not eq_gdf.empty:
     shake_proj = shake_gdf.to_crs(3857)
     eq_proj = eq_gdf.to_crs(3857)
@@ -1296,7 +1300,6 @@ else:
     shake_with_eq["eq_id"] = None
 
 # JOIN EXPOSURE POINTS WITH SHAKE POLYGONS
-
 if not shake_with_eq.empty and not points_gdf.empty:
     for col in ['index_left', 'index_right']:
         if col in shake_with_eq.columns:
@@ -1315,25 +1318,24 @@ if not shake_with_eq.empty and not points_gdf.empty:
         .drop_duplicates(subset=['unique_point_id', 'eq_id'])
     )
 
+    # Keep participant_name in aggregation
     trapped_by_shake_eq = (
-        join_shake.groupby(['eq_id', 'shake_id', 'intensity'], as_index=False)['trapped_exposure_usd']
+        join_shake.groupby(['eq_id', 'shake_id', 'intensity','participant_name'], as_index=False)['trapped_exposure_usd']
         .sum()
     )
 
 else:
-    trapped_by_shake_eq = pd.DataFrame(columns=['eq_id', 'shake_id', 'intensity', 'trapped_exposure_usd'])
+    trapped_by_shake_eq = pd.DataFrame(columns=['eq_id', 'shake_id', 'intensity','participant_name', 'trapped_exposure_usd'])
 
 # TRAPPED EXPOSURE PER EARTHQUAKE
-
 if not eq_gdf.empty and not points_gdf.empty:
     join_eq = gpd.sjoin(points_gdf, eq_gdf, how="inner", predicate="intersects")
-    trapped_per_eq = join_eq.groupby(["eq_id","mag","place"], as_index=False)["trapped_exposure_usd"].sum()
+    trapped_per_eq = join_eq.groupby(["eq_id","mag","place","participant_name"], as_index=False)["trapped_exposure_usd"].sum()
 else:
-    trapped_per_eq = pd.DataFrame(columns=["eq_id","mag","place","trapped_exposure_usd"])
+    trapped_per_eq = pd.DataFrame(columns=["eq_id","mag","place","participant_name","trapped_exposure_usd"])
     print("⚠️ No trapped exposure data for earthquakes ≥6")
 
 # CONVERT BACK TO EPSG:4326 FOR MAPPING
-
 for gdf_name in ["points_gdf","shake_with_eq","prob_gdf","eq_gdf"]:
     if gdf_name in locals() and not locals()[gdf_name].empty:
         locals()[gdf_name] = locals()[gdf_name].to_crs("EPSG:4326")
@@ -1373,30 +1375,29 @@ folium.LayerControl(collapsed=True).add_to(m)
 
 # LEGEND + HURRICANE SUMMARY HTML
 
+# -----------------------
+# 1️⃣ Legend HTML + Quick Zoom
+# -----------------------
 legend_html = """
-<div id="legend" style="position: fixed; bottom: 30px; left: 30px; width: 380px; max-height: 400px; overflow-y: auto; background-color: white; border:2px solid grey; z-index:9999; font-size:14px; border-radius: 8px; padding:10px; box-shadow:2px 2px 6px rgba(0,0,0,0.3);">
+<div id="legend" style="position: fixed; bottom: 30px; left: 30px; width: 380px; max-height: 400px; overflow-y: auto; 
+                        background-color: white; border:2px solid grey; z-index:9999; font-size:14px; border-radius: 8px; padding:10px; 
+                        box-shadow:2px 2px 6px rgba(0,0,0,0.3);">
   <div onclick="toggleLegend()" style="background:#f2f2f2;cursor:pointer;padding:5px;font-weight:bold;">
     Legend + Quick Zoom (click to expand/collapse)
   </div>
   <div id="legend-content" style="display:none; padding:5px;">
-
-     <b>Hurricanes</b><br>
+    <b>Hurricanes</b><br>
     <i style="background:#87CEFA50;width:15px;height:15px;float:left;margin-right:5px;border:1px solid #003366;"></i> Forecast Cone<br>
     <i style="background:#000000;width:15px;height:2px;float:left;margin-right:5px;"></i> Forecast / Historic Track<br><br>
 
     <b>Hurricane Force Probability</b><br>
-    <div style="position: relative; width: 150px; height: 15px; background: linear-gradient(to right, 
-    #7CFC0070 0%, 
-    #FFFF0070 20%, 
-    #FFA50070 40%, 
-    #FF000070 60%, 
-    #80008070 80%, 
-    #80008070 100%); border:1px solid #000; margin:5px 0;"></div>
+    <div style="position: relative; width: 150px; height: 15px; 
+                background: linear-gradient(to right, #7CFC0070 0%, #FFFF0070 20%, #FFA50070 40%, #FF000070 60%, #80008070 80%, #80008070 100%);
+                border:1px solid #000; margin:5px 0;"></div>
     <div style="display: flex; justify-content: space-between; font-size: 12px; width: 150px; margin-top: 2px;">
-    <span>0%</span>
-    <span>100%</span>
-    </div>
-    <br>
+      <span>0%</span>
+      <span>100%</span>
+    </div><br>
 
     <b>Earthquakes (last 7 days)</b><br>
     <i style="background:#ce4823;width:15px;height:15px;float:left;margin-right:5px;"></i> M6.0–7.0<br>
@@ -1410,7 +1411,6 @@ legend_html = """
     <i style="background:#FF6666;width:15px;height:15px;float:left;margin-right:5px;"></i> 9<br>
     <i style="background:#8B0000;width:15px;height:15px;float:left;margin-right:5px;"></i> 10<br><br>
 
-
     <b>Wildfires</b><br>
     <i style="background:red;width:15px;height:15px;float:left;margin-right:5px;"></i> Wildfire Daily Fire Perimeter<br>
     <i style="background:orange;width:15px;height:15px;float:left;margin-right:5px;"></i> Other Fire<br><br>
@@ -1423,494 +1423,326 @@ legend_html = """
 
     <b>Quick Zoom</b><br>
     <div style="margin-top:5px;">
-        <div onclick="zoomTo('usa')" style="display:inline-block; padding:3px 6px; margin:2px; background:#007bff; color:white; border-radius:4px; cursor:pointer;">USA</div>
-        <div onclick="zoomTo('europe')" style="display:inline-block; padding:3px 6px; margin:2px; background:#007bff; color:white; border-radius:4px; cursor:pointer;">Europe</div>
-        <div onclick="zoomTo('japan')" style="display:inline-block; padding:3px 6px; margin:2px; background:#007bff; color:white; border-radius:4px; cursor:pointer;">Japan</div>
-        <div onclick="zoomTo('world')" style="display:inline-block; padding:3px 6px; margin:2px; background:#007bff; color:white; border-radius:4px; cursor:pointer;">World</div>
+        <div onclick="zoomTo('usa')" style="display:inline-block;padding:3px 6px;margin:2px;background:#007bff;color:white;border-radius:4px;cursor:pointer;">USA</div>
+        <div onclick="zoomTo('europe')" style="display:inline-block;padding:3px 6px;margin:2px;background:#007bff;color:white;border-radius:4px;cursor:pointer;">Europe</div>
+        <div onclick="zoomTo('japan')" style="display:inline-block;padding:3px 6px;margin:2px;background:#007bff;color:white;border-radius:4px;cursor:pointer;">Japan</div>
+        <div onclick="zoomTo('world')" style="display:inline-block;padding:3px 6px;margin:2px;background:#007bff;color:white;border-radius:4px;cursor:pointer;">World</div>
     </div>
-
   </div>
 </div>
 
 <script>
-function toggleLegend() {
+function toggleLegend() {{
   var x = document.getElementById("legend-content");
   x.style.display = (x.style.display === "none") ? "block" : "none";
-}
+}}
 
-function getMap() {
+function getMap() {{
     if (window._leaflet_map) return window._leaflet_map;
-    for (var key in window) {
-        if (window[key] instanceof L.Map) {
+    for (var key in window) {{
+        if (window[key] instanceof L.Map) {{
             window._leaflet_map = window[key];
             return window._leaflet_map;
-        }
-    }
+        }}
+    }}
     return null;
-}
+}}
 
-function zoomTo(region) {
+function zoomTo(region) {{
     var map = getMap();
     if (!map) return;
-    if (region === 'usa') { map.setView([37.8, -96], 4); }
-    else if (region === 'europe') { map.setView([54, 15], 4); }
-    else if (region === 'japan') { map.setView([36, 138], 5); }
-    else if (region === 'world') { map.setView([20, 0], 2); }
-}
+    if (region === 'usa') {{ map.setView([37.8, -96], 4); }}
+    else if (region === 'europe') {{ map.setView([54, 15], 4); }}
+    else if (region === 'japan') {{ map.setView([36, 138], 5); }}
+    else if (region === 'world') {{ map.setView([20, 0], 2); }}
+}}
 
-// Pre-cache map reference after Leaflet initializes
 setTimeout(getMap, 1000);
 </script>
 """
-
 m.get_root().html.add_child(folium.Element(legend_html))
 
-# HURRICANE SUMMARY PANEL 
 
-latest_storms = defaultdict(dict)
-for feature in hurr_data.get("features", []):
-    props = feature.get("properties", {})
-    name = props.get("STORMNAME", "Unknown")
-    storm_type = props.get("STORMTYPE", "Unknown")
-    date_str = props.get("DATE", "")
-    try:
-        dt = datetime.fromisoformat(date_str) if date_str else now
-    except:
-        dt = now
-    if name not in latest_storms or dt > latest_storms[name]["datetime"]:
-        latest_storms[name] = {"name": name, "type": storm_type, "datetime": dt}
+# -----------------------
+# Step 0: Aggregate exposures by hazard (one row per hazard)
+# -----------------------
 
-today = datetime.now(timezone.utc).date()
-storms_today = [s for s in latest_storms.values() if s["datetime"].date() == today]
-storms_today = sorted(storms_today, key=lambda x: x["datetime"], reverse=True)
+# Ensure IDs are strings
+if not trapped_per_storm_prob.empty:
+    trapped_per_storm_prob['storm'] = trapped_per_storm_prob['storm'].astype(str)
+if not trapped_per_eq.empty:
+    trapped_per_eq['eq_id'] = trapped_per_eq['eq_id'].astype(str)
 
-hurricane_bounds_js = json.dumps(hurricane_location_bounds)
+# Aggregate total exposure per hurricane/storm
+total_per_storm = trapped_per_storm_prob.groupby('storm')['trapped_exposure_usd'].sum().to_dict()
 
-from collections import defaultdict
-import json
+# Aggregate total exposure per earthquake
+total_per_eq = trapped_per_eq.groupby('eq_id')['trapped_exposure_usd'].sum().to_dict()
 
-
-# Prepare latest storms
-
-latest_storms = {}
-for feature in hurr_data.get("features", []):
-    props = feature.get("properties", {})
-    name = props.get("STORMNAME", "Unknown")
-    storm_type = props.get("STORMTYPE", "Unknown")
-    date_str = props.get("DATE", "")
-    try:
-        dt = datetime.fromisoformat(date_str) if date_str else now
-    except:
-        dt = now
-    if name not in latest_storms or dt > latest_storms[name]["datetime"]:
-        latest_storms[name] = {"name": name, "type": storm_type, "datetime": dt}
-
-today = datetime.now(timezone.utc).date()
-storms_today = sorted(
-    [s for s in latest_storms.values() if s["datetime"].date() == today],
-    key=lambda x: x["datetime"],
-    reverse=True
-)
-
-# EARTHQUAKES ≥6 & SHAKE POLYGONS 
-
-shake_features = eq_intensity_data.get("features", [])
-shake_polys = []
-
-for i, f in enumerate(shake_features):
-    try:
-        geom = shape(f.get("geometry", {}))
-        if geom.is_empty:
-            continue
-        intensity = f.get("properties", {}).get("grid_value", 0)
-        shake_polys.append({
-            "shake_id": f"shake{i}",
-            "geometry": geom,
-            "intensity": intensity
-        })
-    except Exception as e:
-        print(f"⚠️ Skipping invalid shake polygon {i}: {e}")
-        continue
-
-if shake_polys:
-    shake_gdf = gpd.GeoDataFrame(shake_polys, geometry="geometry", crs="EPSG:4326")
-    shake_gdf["geometry"] = shake_gdf.geometry.apply(lambda g: g if g.is_valid else g.buffer(0))
-    eq_gdf["geometry"] = eq_gdf.geometry.apply(lambda g: g if g.is_valid else g.buffer(0))
-
-else:
-    print("⚠️ No valid shake polygons found — creating empty GeoDataFrame.")
-    shake_gdf = gpd.GeoDataFrame(columns=["shake_id", "geometry", "intensity"], geometry="geometry", crs="EPSG:4326")
-
-# Earthquake points ≥6
-
-eq_features = [
-    f for f in eq_points_data.get("features", [])
-    if isinstance(f.get("properties", {}).get("mag"), (int, float)) and f.get("properties", {}).get("mag") >= 6
-]
-eq_records = []
-for i, f in enumerate(eq_features):
-    try:
-        geom = shape(f["geometry"])
-        eq_records.append({
-            "eq_id": f["properties"].get("id", f"eq{i}"),
-            "geometry": geom,
-            "mag": f["properties"].get("mag"),
-            "place": f["properties"].get("place", "Unknown")
-        })
-    except Exception as e:
-        print(f"⚠️ Skipping invalid earthquake feature {i}: {e}")
-        continue
-
-if eq_records:
-    eq_gdf = gpd.GeoDataFrame(eq_records, geometry="geometry", crs="EPSG:4326")
-else:
-    eq_gdf = gpd.GeoDataFrame(columns=["eq_id", "geometry", "mag", "place"], geometry="geometry", crs="EPSG:4326")
-
-# LINK SHAKE POLYGONS TO NEAREST EARTHQUAKE 
-
-if not shake_gdf.empty and not eq_gdf.empty:
-    shake_proj = shake_gdf.to_crs(3857)
-    eq_proj = eq_gdf.to_crs(3857)
-
-    shake_with_eq = gpd.sjoin_nearest(
-        shake_proj, eq_proj[['eq_id', 'geometry']], how='left', distance_col='dist'
-    )
-
-    shake_with_eq = shake_with_eq.to_crs(4326)
-else:
-    shake_with_eq = shake_gdf.copy()
-    shake_with_eq["eq_id"] = None
-
-# LINK POINTS TO SHAKE POLYGONS 
-
-if not shake_with_eq.empty and not points_gdf.empty:
-
-    for col in ['index_left', 'index_right']:
-        if col in shake_with_eq.columns:
-            shake_with_eq = shake_with_eq.drop(columns=[col])
-        if col in points_gdf.columns:
-            points_gdf = points_gdf.drop(columns=[col])
-
-    join_shake = gpd.sjoin(points_gdf, shake_with_eq, how="inner", predicate="intersects")
-
-    if 'unique_point_id' not in join_shake.columns:
-        print("⚠️ 'unique_point_id' missing after join — re-adding from index.")
-        join_shake = join_shake.reset_index().rename(columns={'index': 'unique_point_id'})
-
-    join_shake = (
-        join_shake.sort_values('intensity', ascending=False)
-        .drop_duplicates(subset=['unique_point_id', 'eq_id'])
-    )
-
-    trapped_by_shake_eq = (
-        join_shake.groupby(['eq_id', 'shake_id', 'intensity'], as_index=False)['trapped_exposure_usd']
-        .sum()
-    )
-
-else:
-    trapped_by_shake_eq = pd.DataFrame(columns=['eq_id', 'shake_id', 'intensity', 'trapped_exposure_usd'])
-
-# SHAKE BOUNDS (for map zoom)
-
-shake_bounds = {}
-if not shake_with_eq.empty:
-    for _, row in shake_with_eq.iterrows():
-        if row.geometry and not row.geometry.is_empty:
-            minx, miny, maxx, maxy = row.geometry.bounds
-            shake_bounds[row["shake_id"]] = [[miny, minx], [maxy, maxx]]
-
-else:
-    trapped_by_shake_eq = pd.DataFrame(columns=['eq_id', 'shake_id', 'intensity', 'trapped_exposure_usd'])
-
-# EARTHQUAKE EXPOSURE (aggregated from shake polygons)
-
-if not shake_with_eq.empty and not points_gdf.empty:
-    if points_gdf.crs != shake_with_eq.crs:
-        points_proj = points_gdf.to_crs(shake_with_eq.crs)
-    else:
-        points_proj = points_gdf.copy()
-
-    if 'unique_point_id' not in points_proj.columns:
-        points_proj = points_proj.reset_index(drop=True)
-        points_proj['unique_point_id'] = points_proj.index
-
-    join_eq = gpd.sjoin(points_proj, shake_with_eq[['eq_id', 'geometry', 'intensity']], how="inner", predicate="intersects")
-
-    join_eq = (
-        join_eq.sort_values('intensity', ascending=False)
-        .drop_duplicates(subset=['unique_point_id', 'eq_id'])
-    )
-
-    trapped_per_eq = (
-        join_eq.groupby(['eq_id'], as_index=False)['trapped_exposure_usd'].sum()
-    )
-
-    trapped_per_eq = trapped_per_eq.merge(eq_gdf[['eq_id', 'mag', 'place']], on='eq_id', how='left')
-
-else:
-    trapped_per_eq = pd.DataFrame(columns=["eq_id", "mag", "place", "trapped_exposure_usd"])
-    print("⚠️ No trapped exposure data for earthquakes ≥6.")
-
-# UNIFIED DISASTER PANEL HTML (hurricanes + earthquakes; shake exposure ≥ intensity 4)
-
-# Assuming `prob_gdf` has polygons for hurricane probability and `points_gdf` has TIV points
-
-# -------------------------
-# PROBABILISTIC HURRICANE / STORM EXPOSURE
-# -------------------------
-
-if 'prob_gdf' in locals() and not prob_gdf.empty and not points_gdf.empty:
-    # Ensure CRS alignment
-    points_proj = points_gdf.to_crs(prob_gdf.crs)
-    
-    # Clean geometries
-    prob_gdf = prob_gdf[prob_gdf.geometry.notnull()].copy()
-    prob_gdf['geometry'] = prob_gdf['geometry'].apply(lambda g: g if g.is_valid else g.buffer(0))
-
-    # Spatial join: points inside each polygon
-    join_hurr = gpd.sjoin(points_proj, prob_gdf[['storm','prob','geometry']], how='inner', predicate='intersects')
-
-    if not join_hurr.empty:
-        # Sum trapped exposure per polygon (use index_right from sjoin)
-        trapped_per_polygon = (
-            join_hurr.groupby('index_right', as_index=False)['trapped_exposure_usd'].sum()
+# Participant-specific exposure for filtering
+hurricane_participant_exposure = {}
+for _, row in trapped_per_storm_prob.iterrows():
+    participants = row['participant_name'].split(', ')
+    for p in participants:
+        hurricane_participant_exposure.setdefault(p, {})
+        hurricane_participant_exposure[p][row['storm']] = (
+            hurricane_participant_exposure[p].get(row['storm'], 0) + row['trapped_exposure_usd']
         )
-        trapped_per_polygon.rename(columns={'trapped_exposure_usd':'trapped_exposure_usd_polygon'}, inplace=True)
 
-        # Merge back into prob_gdf
-        prob_gdf = prob_gdf.reset_index()
-        prob_gdf = prob_gdf.merge(trapped_per_polygon, left_on='index', right_on='index_right', how='left')
-        prob_gdf['trapped_exposure_usd_polygon'] = prob_gdf['trapped_exposure_usd_polygon'].fillna(0)
-    else:
-        prob_gdf['trapped_exposure_usd_polygon'] = 0
-else:
-    prob_gdf['trapped_exposure_usd_polygon'] = 0
-    print("⚠️ prob_gdf or points_gdf is empty — no hurricane trapped exposure calculated")
+earthquake_participant_exposure = {}
+for _, row in trapped_per_eq.iterrows():
+    participants = row['participant_name'].split(', ')
+    for p in participants:
+        earthquake_participant_exposure.setdefault(p, {})
+        earthquake_participant_exposure[p][row['eq_id']] = (
+            earthquake_participant_exposure[p].get(row['eq_id'], 0) + row['trapped_exposure_usd']
+        )
 
-shakes_filtered = trapped_by_shake_eq[trapped_by_shake_eq['intensity'] >= 4]
+# Total trapped exposure per participant (all hazards)
+participant_trapped = {
+    p: sum(list(hurricane_participant_exposure.get(p, {}).values()) +
+           list(earthquake_participant_exposure.get(p, {}).values()))
+    for p in set(list(hurricane_participant_exposure.keys()) + list(earthquake_participant_exposure.keys()))
+}
 
-eq_trapped_summary = (
-    trapped_by_shake_eq.groupby('eq_id', as_index=False)['trapped_exposure_usd']
-    .sum()
-)
+# Convert to JSON for JS
+import json
+participant_json = json.dumps(participant_trapped)
+hurricane_participant_json = json.dumps(hurricane_participant_exposure)
+earthquake_participant_json = json.dumps(earthquake_participant_exposure)
 
-eq_trapped_summary = eq_trapped_summary.merge(
-    trapped_per_eq[['eq_id', 'mag', 'place']],
-    on='eq_id',
-    how='left'
-)
-
-eq_trapped_summary = eq_trapped_summary[eq_trapped_summary['mag'] >= 6]
-
-
-shake_bounds_json = json.dumps({
-    row["shake_id"]: [[row.geometry.centroid.y, row.geometry.centroid.x]] 
-    for _, row in shake_with_eq[shake_with_eq['intensity'] >= 4].iterrows()
-})
-
-eq_bounds_json = json.dumps({
-    row["eq_id"]: [[row.geometry.y, row.geometry.x]] 
-    for _, row in eq_gdf.iterrows()
-})
-
+# Metadata for zooming
 hurricane_bounds_json = json.dumps({str(k): v for k, v in hurricane_location_bounds.items()})
 
-disaster_panel_html = """
-<div id="disaster-panel" style="position: fixed; bottom: 30px; right: 30px; width: 380px; max-height: 500px; overflow-y: auto; background-color: white; border:2px solid grey; z-index:9999; font-size:14px; border-radius: 8px; padding:10px; box-shadow:2px 2px 6px rgba(0,0,0,0.3);">
+# Build earthquake metadata with proper coordinates
+if 'latitude' not in eq_gdf.columns or 'longitude' not in eq_gdf.columns:
+    eq_gdf['latitude'] = eq_gdf.geometry.y
+    eq_gdf['longitude'] = eq_gdf.geometry.x
+
+eq_meta = eq_gdf.set_index('eq_id')[['mag', 'place', 'latitude', 'longitude']].to_dict(orient='index')
+eq_meta = {str(k): v for k, v in eq_meta.items()}
+
+# Store both meta and bounds in JSON
+eq_bounds_json = json.dumps({str(eq_id): [[meta['latitude'], meta['longitude']]] for eq_id, meta in eq_meta.items()})
+
+# -----------------------
+# Step 1: Disaster Panel HTML (one row per hazard)
+# -----------------------
+disaster_panel_html = f"""
+<div id="disaster-panel" style="position: fixed; bottom: 30px; right: 30px; width: 380px; max-height: 500px; overflow-y: auto; 
+     background-color: white; border:2px solid grey; z-index:9999; font-size:14px; border-radius: 8px; padding:10px; 
+     box-shadow:2px 2px 6px rgba(0,0,0,0.3);">
 <div style="font-weight:bold; cursor:pointer;" onclick="togglePanel('disaster-content')">
 Active Disasters & Trapped Exposure (click to expand/collapse)
 </div>
 <div id="disaster-content" style="padding-top:5px; display:block;">
+
 <b>Hurricanes (Trapped Exposure)</b><br>
 """
 
-if not trapped_per_storm_prob.empty:
-    for _, row in trapped_per_storm_prob.iterrows():
-        prob_text = (
-            f"Prob {row['prob']:.0f}%"
-            if row['prob'] > 0
-            else "Cone of Uncertainty"
-        )
-        disaster_panel_html += f"""
-        <div style="margin-bottom:4px;">
-            <span style="color:#1E90FF; cursor:pointer;" onclick="zoomToHurricane('{row['storm']}')">
-                {row['storm']} ({prob_text}): ${row['trapped_exposure_usd']:,.0f}
-            </span>
-        </div>
-        """
-
-else:
-    disaster_panel_html += "<i>No active hurricanes detected.</i>"
+for storm, total in total_per_storm.items():
+    disaster_panel_html += f"""
+    <div style="margin-bottom:6px;" id="hurr-{storm}" data-label="{storm}">
+        <span style="color:#1E90FF; font-weight:bold; cursor:pointer;" onclick="zoomToHurricane('{storm}')">
+            {storm}: ${total:,.0f}
+        </span>
+    </div>
+    """
 
 disaster_panel_html += "<br><b>Earthquakes ≥6 (Trapped Exposure)</b><br>"
 
-if not eq_trapped_summary.empty:
-    for _, eq_row in eq_trapped_summary.iterrows():
+if total_per_eq:
+    for eq_id, total in total_per_eq.items():
+        meta = eq_meta.get(eq_id, {})
+        label = f"M{meta.get('mag',0):.1f} – {meta.get('place','Unknown')}"
         disaster_panel_html += f"""
-        <div style="margin-bottom:4px;">
-            <div style="margin-left:5px; margin-bottom:2px; font-size:13px; color:#ce4823; cursor:pointer;" onclick="zoomToEarthquake('{eq_row['eq_id']}')">
-                M{eq_row['mag']:.1f} – {eq_row['place']}: ${eq_row['trapped_exposure_usd']:,.0f}
+        <div style="margin-bottom:4px;" id="eq-{eq_id}" data-label="{label}">
+            <div style="margin-left:5px; margin-bottom:2px; font-size:13px; color:#ce4823; cursor:pointer;" 
+                 onclick="zoomToEarthquake('{eq_id}')">
+                {label}: ${total:,.0f}
             </div>
         </div>
         """
-
 else:
     disaster_panel_html += "<i>No earthquakes ≥ M6 detected in the last 7 days.</i>"
 
 disaster_panel_html += "</div></div>"
 
+# -----------------------
+# Step 2: Participant Banner HTML (scrollable multi-select)
+# -----------------------
+banner_html = f"""
+<div id="top-banner" style="
+    position: fixed; 
+    top: 0; 
+    left: 0; 
+    width: 100%; 
+    backdrop-filter: blur(8px);
+    background: rgba(0, 0, 0, 0.6); 
+    color: white; 
+    z-index: 10001;
+    display: flex; 
+    align-items: center; 
+    padding: 5px 20px; 
+    font-family: Arial, sans-serif;
+    height: 60px; 
+    box-sizing: border-box; 
+    gap: 20px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+">
+
+    <!-- Title -->
+    <div style="display:flex; flex-direction:column; justify-content:center;">
+        <span style="font-size: 32px; font-weight: bold;">LENS</span>
+        <span style="font-size: 12px;">Loss Exposure & Natural-hazard Scanner</span>
+    </div>
+
+    <!-- Participant Selector (single dropdown) -->
+    <div style="margin-left: 30px;">
+        <label for="participantSelect" style="font-size: 13px; margin-right: 6px;">Participant:</label>
+        <select id="participantSelect"
+                style="padding:5px 8px; font-size:13px; border-radius:6px; border:none; outline:none; cursor:pointer;"
+                onchange="updateParticipantView()">
+            <option value="" selected>All Participants</option>
+            {"".join([f'<option value="{p}">{p}</option>' for p in participant_trapped.keys()])}
+        </select>
+    </div>
+
+    <!-- Total trapped exposure -->
+    <div style="margin-left: auto; font-size:13px; white-space: nowrap;">
+        <b>Total Trapped Exposure (USD):</b> 
+        <span id="total-trapped" style="color:#00FF7F; font-weight:bold;">0</span>
+    </div>
+
+</div>
+"""
+
+# -----------------------
+# Step 3: JS Interactivity
+# -----------------------
 disaster_panel_html += f"""
 <script>
+window.participantTrapped = {participant_json};
+window.hurricaneParticipantExposure = {hurricane_participant_json};
+window.earthquakeParticipantExposure = {earthquake_participant_json};
+var hurricane_bounds = {hurricane_bounds_json};
+var eq_bounds = {eq_bounds_json};
+
 function togglePanel(contentId) {{
-    var content = document.getElementById(contentId);
-    if (!content) return;
-    content.style.display = (content.style.display==='none')?'block':'none';
+  var content = document.getElementById(contentId);
+  if (content) content.style.display = content.style.display === 'none' ? 'block' : 'none';
 }}
 
 function getMap() {{
-    if(window._leaflet_map) return window._leaflet_map;
-    for(var k in window) if(window[k] instanceof L.Map) {{window._leaflet_map=window[k]; return window._leaflet_map;}}
-    return null;
+  if (window._leaflet_map) return window._leaflet_map;
+  for (var k in window)
+    if (window[k] instanceof L.Map) {{
+      window._leaflet_map = window[k];
+      return window._leaflet_map;
+    }}
+  return null;
 }}
 
-var hurricane_bounds = {hurricane_bounds_json};
-var eq_bounds = {eq_bounds_json};
-var shake_bounds = {shake_bounds_json};
-
 function zoomToHurricane(name) {{
-    if(!name) return;
     var map = getMap();
-    if(!map) return;
+    if (!map) return;
+
     var bounds = hurricane_bounds[name];
-    if(bounds) {{
-        map.fitBounds(bounds, {{padding:[50,50]}});
+    if (!bounds) return;
+
+    // Convert bounds to LatLngBounds
+    var latLngBounds = L.latLngBounds(bounds);
+
+    // Fit bounds with padding
+    map.fitBounds(latLngBounds, {{
+        padding: [50, 50],  // padding in pixels
+        maxZoom: 6           // prevent over-zooming
+   }});
+
+    // Optional: ensure minimum zoom for very small bounds
+    var currentZoom = map.getZoom();
+    var minZoom = 3;  // adjust minimum zoom level
+    if (currentZoom < minZoom) {{
+        map.setZoom(minZoom);
     }}
 }}
 
 function zoomToEarthquake(eq_id) {{
-    if(!eq_id) return;
-    var map = getMap();
-    if(!map) return;
-    var coords = eq_bounds[eq_id];
-    if(coords) map.setView(coords[0],7);
-}}
-
-function zoomToShake(shake_id) {{
-    if(!shake_id) return;
-    var map = getMap();
-    if(!map) return;
-    var bounds = shake_bounds[shake_id];
-    if(bounds) map.fitBounds(bounds, {{padding:[30,30]}});
-}}
-</script>
-"""
-
-m.get_root().html.add_child(folium.Element(disaster_panel_html))
-
-# TOP BANNER (text only) + LARGE LENS TEXT + SHIFTED UI CONTROLS
-
-import json
- 
-# === PARTICIPANT DROPDOWN + LIVE TRAPPED EXPOSURE PANEL ===
-
-participant_trapped = (
-    tiv_df.groupby('participant_name')['trapped_exposure_usd'].sum().to_dict()
-)
-participant_json = json.dumps(participant_trapped)
-
-banner_html = f"""
-<div id="top-banner" style="
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    background: rgba(0, 0, 0, 0.85);
-    color: white;
-    z-index: 9999;
-    display: flex;
-    align-items: center;
-    justify-content: flex-start;
-    padding: 5px 20px;
-    font-family: Arial, sans-serif;
-    height: 50px;
-    box-sizing: border-box;
-">
-    <span style="font-size: 36px; font-weight: bold;">LENS</span>
-    <span style="font-size: 12px; margin-left: 10px;">Loss Exposure & Natural-hazard Scanner</span>
-
-    <select id="participantSelect" multiple style="margin-left:20px; padding:2px; font-size:12px;" onchange="updateParticipantView()"></select>
-
-    <div style="margin-left: 40px; font-size:13px;">
-        <b>Total Trapped Exposure (USD):</b> <span id="total-trapped" style="color:#00FF7F;">0</span>
-    </div>
-</div>
-
-<script>
-window.participantTrapped = {participant_json};
-var participants = Object.keys(window.participantTrapped || {{}});
-
-var select = document.getElementById('participantSelect');
-participants.forEach(function(p) {{
-    var opt = document.createElement('option');
-    opt.value = p;
-    opt.innerText = p;
-    select.appendChild(opt);
-}});
-
-function getMap() {{
-    if(window._leaflet_map) return window._leaflet_map;
-    for(var k in window) {{
-        if(window[k] instanceof L.Map) {{
-            window._leaflet_map = window[k];
-            return window._leaflet_map;
-        }}
-    }}
-    return null;
+  var map = getMap();
+  if (!map) return;
+  var coords = eq_bounds[eq_id];
+  if (coords) map.setView(coords[0], 7);
 }}
 
 function updateParticipantView() {{
-    var selected = Array.from(select.selectedOptions).map(opt => opt.value);
-    var map = getMap();
-    if(!map) return;
+  var select = document.getElementById('participantSelect');
+  var selected = [select.value];
+  if (selected[0] === '') selected = Object.keys(window.participantTrapped);
 
-    // Toggle visibility for participant layers
-    participants.forEach(function(p) {{
-        ['1','2'].forEach(function(id) {{
-            var key = p + '_' + id;
-            if(window.participant_layers && window.participant_layers[key]) {{
-                if(selected.includes(p)) map.addLayer(window.participant_layers[key]);
-                else map.removeLayer(window.participant_layers[key]);
-            }}
-        }});
-        var heatKey = p + '_heat';
-        if(window.participant_layers && window.participant_layers[heatKey]) {{
-            if(selected.includes(p)) map.addLayer(window.participant_layers[heatKey]);
-            else map.removeLayer(window.participant_layers[heatKey]);
-        }}
-    }});
+  // --- Total trapped exposure ---
+  var total = 0;
+  selected.forEach(p => {{
+    if (window.participantTrapped[p]) total += window.participantTrapped[p];
+  }});
+  document.getElementById('total-trapped').innerText = total.toLocaleString();
 
-    // Update trapped exposure totals
-    var total = 0;
-    selected.forEach(function(p) {{
-        if(window.participantTrapped[p]) total += window.participantTrapped[p];
+  // --- Hurricanes: aggregate across participants ---
+  document.querySelectorAll('[id^="hurr-"]').forEach(el => {{
+    var storm = el.getAttribute('data-label');
+    var totalStorm = 0;
+    selected.forEach(p => {{
+      if (window.hurricaneParticipantExposure[p] && window.hurricaneParticipantExposure[p][storm])
+        totalStorm += window.hurricaneParticipantExposure[p][storm];
     }});
-    document.getElementById('total-trapped').innerText = total.toLocaleString();
+    el.querySelector('span').innerText = storm + ': $' + totalStorm.toLocaleString();
+  }});
+
+  // --- Earthquakes: aggregate across participants ---
+  document.querySelectorAll('[id^="eq-"]').forEach(el => {{
+    var eq_id = el.id.replace('eq-', '');
+    var label = el.getAttribute('data-label');
+    var totalEq = 0;
+    selected.forEach(p => {{
+      if (window.earthquakeParticipantExposure[p] && window.earthquakeParticipantExposure[p][eq_id])
+        totalEq += window.earthquakeParticipantExposure[p][eq_id];
+    }});
+    el.querySelector('div').innerText = label + ': $' + totalEq.toLocaleString();
+  }});
 }}
 </script>
+"""
 
+# -----------------------
+# Step 4: Add HTML to map
+# -----------------------
+m.get_root().html.add_child(folium.Element(disaster_panel_html))
+m.get_root().html.add_child(folium.Element(banner_html))
+
+# -----------------------
+# Step 6: Adjust Leaflet controls so top banner doesn't overlap
+# -----------------------
+controls_css = """
 <style>
-#participantSelect {{
-    position: relative;
-    z-index: 1200;
-}}
-.folium-map {{ position: relative; top: 50px; }}
-.leaflet-top.leaflet-left, .leaflet-top.leaflet-right {{ top: 50px; }}
+/* Move zoom control and layers control down to avoid overlap with top banner */
+.leaflet-top.leaflet-left {
+    top: 80px !important; /* banner height (60px) + spacing */
+    left: 10px !important;
+}
+.leaflet-top.leaflet-right {
+    top: 80px !important;
+    right: 10px !important;
+}
+#top-banner {
+    z-index: 10000 !important;
+    position: fixed !important;
+}
 </style>
 """
 
-m.get_root().html.add_child(folium.Element(banner_html))
+m.get_root().html.add_child(folium.Element(controls_css))
 
-# SAVE MAP
-
-m.save("full_disaster_map_test.html")
-print("✅ Map saved as full_disaster_map_test.html")
+# -----------------------
+# Step 5: Save map
+# -----------------------
+m.save("full_disaster_map_one_row_per_hazard.html")
+print("✅ Map saved as full_disaster_map_one_row_per_hazard.html")
